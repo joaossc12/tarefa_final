@@ -63,7 +63,8 @@ target_link_libraries(tarefa_final
                     pico_stdlib
                     hardware_i2c
                     hardware_pwm
-                    hardware_pio 
+                    hardware_pio
+                    hardware_timer 
         )
 
 pico_add_extra_outputs(tarefa_final)
