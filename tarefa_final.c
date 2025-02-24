@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
@@ -30,6 +31,8 @@
 #define JOYSTICK_BT 22 
 #define BUZZER 21
 #define LED_MATRIX 7
+#define TOTAL_LEDS 25
+#define MAX_LED_VALUE 60
 
 #define MAX_FUNC(a, b) (((a) >= (b)) ? (a) : (b))
 #define MIN_FUNC(a, b) (((a) <= (b)) ? (a) : (b))
@@ -50,17 +53,19 @@ ssd1306_t ssd; //Display de 128 x 64
 
 //Tanque
 //-Controle Volume
-double volume = 0;
-double  volume_max = 1000; //Volume máximo do tanque em L
-double vel_input = 100; //Vazão de entrada 
-double  vel_output = 50; //Vazão de saída
-double  vel_max = 200; //Vazão maxima de entrada ou saída
+volatile double volume = 0;
+static double  volume_max = 1000; //Volume máximo do tanque em L
+volatile double vel_input = 100; //Vazão de entrada 
+volatile double  vel_output = 50; //Vazão de saída
+static double vel_max = 200; //Vazão maxima de entrada ou saída
 volatile bool flag_input = 0; //Estado da valvula de entrada
 volatile bool flag_output = 0; //Estado da valvula de saída
-bool flag_max = 0;
-uint16_t sample_time = 500; //Periodo de amostragem em ms
-//-Controle matriz de led
+volatile bool flag_max = 0;
+volatile bool flag_min = 0;
 bool flag_perigo = 0;
+uint16_t sample_time = 100; //Periodo de amostragem em ms
+
+
 
 
 //---------------------------------------------------
@@ -70,12 +75,52 @@ bool flag_perigo = 0;
 static void callback_button(uint gpio, uint32_t events);
 bool atualiza_dados(struct repeating_timer *t);
 void init_pinos();
-void controle_vazão();
-
-#define TOTAL_LEDS 25
-#define MAX_LED_VALUE 150
-
+void controle_vazão(int adc_value_x, int adc_value_y);
 void controle_matrix(PIO pio, uint sm, double volume, bool flag_perigo);
+void controle_display(){
+    uint16_t volume_p100 = (uint16_t)100*(volume / volume_max);
+    uint16_t vel_input_p100 =(uint16_t)100*(vel_input / vel_max);
+    uint16_t vel_output_p100 =(uint16_t)100*(vel_output / vel_max);
+    char exibir_volume[3];
+    char exibir_input[3];
+    char exibir_output[3];
+    sprintf(exibir_volume,"%d",volume_p100);
+    sprintf(exibir_input,"%d",vel_input_p100);
+    sprintf(exibir_output,"%d",vel_output_p100);
+    ssd1306_fill(&ssd, false);
+    ssd1306_rect(&ssd, 0,0,126,62,1,0);
+    ssd1306_draw_string(&ssd,"IHM CONTROLE", 10,2);
+    ssd1306_draw_string(&ssd,"VOLUME =", 4,14);
+    ssd1306_draw_string(&ssd,exibir_volume, 88,14);
+    ssd1306_draw_char(&ssd,'%', 112,14);
+    ssd1306_draw_string(&ssd,"V.ENTRADA =", 4,26);
+    ssd1306_draw_string(&ssd,exibir_input, 88,26);
+    ssd1306_draw_char(&ssd,'%', 112,26);
+    ssd1306_draw_string(&ssd,"V.SAIDA =", 4,38);
+    ssd1306_draw_string(&ssd,exibir_output, 88,38);
+    ssd1306_draw_char(&ssd,'%', 112,38);
+
+char msg[20];  // Buffer para a mensagem
+int pos_x = 2; // Posição padrão para os caracteres mais curtos
+
+if (flag_max) {
+    strcpy(msg, "TANQUE CHEIO");
+    pos_x = 8;
+} else if (flag_min) {  // Supondo que "flag_mim" represente "tanque vazio"
+    strcpy(msg, "TANQUE VAZIO");
+    pos_x = 8;
+} else {
+    // Formata uma mensagem curta para os estados de entrada e saída:
+    // Ex.: "I1 O0" indica Input=1 e Output=0
+    sprintf(msg, "IN = %d OUT = %d", flag_input ? 1 : 0, flag_output ? 1 : 0);
+}
+
+ssd1306_draw_string(&ssd, msg, pos_x, 50);
+
+    ssd1306_send_data(&ssd);
+    printf("PORCENTAGEM DE VOLUME: %d \n", volume_p100);
+}
+
 int main()
 {
     stdio_init_all();
@@ -102,6 +147,7 @@ int main()
     ssd1306_send_data(&ssd); // Envia os dados para o display
     ssd1306_fill(&ssd, false); //Apaga todos pixels
     ssd1306_send_data(&ssd); //Envia o comando
+
     //PIO
     PIO pio = pio0;
     bool clk = set_sys_clock_khz(128000, false);
@@ -115,9 +161,10 @@ int main()
         adc_select_input(0); // Seleciona o ADC para eixo Y. O pino 26 como entrada analógica
         adc_value_y = adc_read();  
         //printf("Valor X: %d \n", adc_value_x); 
-        controle_vazão();
+        controle_vazão(adc_value_x, adc_value_y);
         controle_matrix(pio,sm,volume, flag_perigo);
-        sleep_ms(1000); 
+        controle_display();
+
     }
 }
 static void callback_button(uint gpio, uint32_t events) {
@@ -152,19 +199,22 @@ bool atualiza_dados(struct repeating_timer *t) {
 
     if (volume >= volume_max){
         gpio_set_irq_enabled(BUTTON_A, GPIO_IRQ_EDGE_FALL, false);
-        flag_perigo = 1;
+        flag_max = 1;
         flag_input = 0;
         printf("Entrada desligada por segurança!\n");
     }else if(volume <= 0){
         gpio_set_irq_enabled(BUTTON_B, GPIO_IRQ_EDGE_FALL, false);
         flag_output = 0;
+        flag_min = 1;
         printf("Saida desligada por segurança!\n");
     } 
     else{
-        flag_perigo = 0;
+        flag_min = 0;
+        flag_max = 0;
         gpio_set_irq_enabled(BUTTON_A, GPIO_IRQ_EDGE_FALL, true);
         gpio_set_irq_enabled(BUTTON_B, GPIO_IRQ_EDGE_FALL, true);
     }
+    flag_perigo = flag_max || flag_min;
     volume = volume + (double)((flag_input * vel_input) - (flag_output * vel_output));
     volume = MAX_FUNC(MIN_FUNC(volume,volume_max),0); //Saturação
 
@@ -201,13 +251,16 @@ gpio_pull_up(I2C_SDA); // Pull up the data line
 gpio_pull_up(I2C_SCL); // Pull up the clock line
 
 }
-void controle_vazão(){
-    double conv_input = (double)(adc_value_x - center_value) *0.0048852; //Converte em um valor de [-10, 10]
+void controle_vazão(int adc_value_x, int adc_value_y){
+    uint8_t tolerancia = 100;
+    uint16_t adc_x = (abs(adc_value_x - center_value) > 100)? adc_value_x : center_value;
+    uint16_t adc_y = (abs(adc_value_y - center_value) > 100)? adc_value_y : center_value;
+    double conv_input = (double)(adc_x - center_value) *0.00048852; //Converte em um valor de [-10, 10]
     vel_input += conv_input;
     vel_input = MAX_FUNC(MIN_FUNC(vel_input,vel_max),0); //Saturação
     printf("Velocidade de entrada: %f \n",vel_input ); 
 
-    double conv_output = (double)(adc_value_y - center_value) *0.0048852; //Converte em um valor de [-10, 10]
+    double conv_output = (double)(adc_y - center_value) *0.00048852; //Converte em um valor de [-10, 10]
     vel_output += conv_output;
     vel_output = MAX_FUNC(MIN_FUNC(vel_output,vel_max),0); //Saturação
     printf("Velocidade de saída: %f \n",vel_output ); 
