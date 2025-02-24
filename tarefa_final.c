@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
@@ -29,6 +30,9 @@
 #define JOYSTICK_BT 22 
 #define BUZZER 21
 #define LED_MATRIX 7
+
+#define MAX_FUNC(a, b) (((a) >= (b)) ? (a) : (b))
+#define MIN_FUNC(a, b) (((a) <= (b)) ? (a) : (b))
 //---------------------------------------------------
 // VARIÁVEIS GLOBAIS
 //----------------------------------------------------
@@ -36,7 +40,7 @@
 //ADC
 uint16_t adc_value_x;
 uint16_t adc_value_y;  
-uint16_t center_value = 2000;//Medido Experimentalmente
+uint16_t center_value = 2047;//Medido Experimentalmente
 //PWM
 uint slice; //GPIO 13 e 12 controladas pelo mesmo slice
 uint16_t wrap = 2048; //Escolhido para facilitar as contas
@@ -45,17 +49,18 @@ float div_clk = 30; //Para aproximadamente 2khz
 ssd1306_t ssd; //Display de 128 x 64
 
 //Tanque
-double volume;
-double volume_max = 1000; //Volume máximo do tanque em L
+//-Controle Volume
+double volume = 0;
+double  volume_max = 1000; //Volume máximo do tanque em L
 double vel_input = 100; //Vazão de entrada 
-double vel_output = 50; //Vazão de saída
-double vel_max = 10; //Vazão maxima de entrada ou saída
-bool flag_input = 0; //Estado da valvula de entrada
-bool flag_output = 0; //Estado da valvula de saída
+double  vel_output = 50; //Vazão de saída
+double  vel_max = 200; //Vazão maxima de entrada ou saída
+volatile bool flag_input = 0; //Estado da valvula de entrada
+volatile bool flag_output = 0; //Estado da valvula de saída
 bool flag_max = 0;
 uint16_t sample_time = 500; //Periodo de amostragem em ms
-
-
+//-Controle matriz de led
+bool flag_perigo = 0;
 
 
 //---------------------------------------------------
@@ -65,7 +70,12 @@ uint16_t sample_time = 500; //Periodo de amostragem em ms
 static void callback_button(uint gpio, uint32_t events);
 bool atualiza_dados(struct repeating_timer *t);
 void init_pinos();
+void controle_vazão();
 
+#define TOTAL_LEDS 25
+#define MAX_LED_VALUE 150
+
+void controle_matrix(PIO pio, uint sm, double volume, bool flag_perigo);
 int main()
 {
     stdio_init_all();
@@ -100,7 +110,14 @@ int main()
     tafera_final_program_init(pio, sm, offset, LED_MATRIX);
 
     while (true) {
-        tight_loop_contents();
+        adc_select_input(1); // Seleciona o ADC para eixo X. O pino 27 como entrada analógica
+        adc_value_x = adc_read();
+        adc_select_input(0); // Seleciona o ADC para eixo Y. O pino 26 como entrada analógica
+        adc_value_y = adc_read();  
+        //printf("Valor X: %d \n", adc_value_x); 
+        controle_vazão();
+        controle_matrix(pio,sm,volume, flag_perigo);
+        sleep_ms(1000); 
     }
 }
 static void callback_button(uint gpio, uint32_t events) {
@@ -113,13 +130,13 @@ static void callback_button(uint gpio, uint32_t events) {
     if (gpio == BUTTON_A) { // Interrupção do botão A
         if (absolute_time_diff_us(last_time_A, now) > 200000) { // Debounce de 200ms
             flag_input = !flag_input;
-            printf("Estado da entrada %b \n", flag_input);
+            printf("Estado da entrada %d \n", flag_input);
             last_time_A = now; // Atualiza o tempo do último evento do botão A
         }
     } else if (gpio == BUTTON_B) { // Interrupção do botão B
         if (absolute_time_diff_us(last_time_B, now) > 200000) { // Debounce de 200ms
             flag_output = !flag_output;
-            printf("Estado da saída %b \n", flag_output);
+            printf("Estado da saída %d \n", flag_output);
             last_time_B = now; // Atualiza o tempo do último evento do botão B
         }
     } else if (gpio == JOYSTICK_BT){ //Interrupção botão joystick
@@ -135,13 +152,23 @@ bool atualiza_dados(struct repeating_timer *t) {
 
     if (volume >= volume_max){
         gpio_set_irq_enabled(BUTTON_A, GPIO_IRQ_EDGE_FALL, false);
-        flag_max = 1;
+        flag_perigo = 1;
         flag_input = 0;
-    }else{
+        printf("Entrada desligada por segurança!\n");
+    }else if(volume <= 0){
+        gpio_set_irq_enabled(BUTTON_B, GPIO_IRQ_EDGE_FALL, false);
+        flag_output = 0;
+        printf("Saida desligada por segurança!\n");
+    } 
+    else{
+        flag_perigo = 0;
         gpio_set_irq_enabled(BUTTON_A, GPIO_IRQ_EDGE_FALL, true);
+        gpio_set_irq_enabled(BUTTON_B, GPIO_IRQ_EDGE_FALL, true);
     }
-    volume = volume + (flag_input * vel_input) - (flag_output * vel_output);
-    printf("Volume = %f \n", volume);
+    volume = volume + (double)((flag_input * vel_input) - (flag_output * vel_output));
+    volume = MAX_FUNC(MIN_FUNC(volume,volume_max),0); //Saturação
+
+    printf("Volume = %f | Estado de entrada: %f| Estado da saída: %f \n", volume, flag_input, flag_output);
 
 }
 void init_pinos(){
@@ -173,4 +200,45 @@ gpio_set_function(I2C_SCL, GPIO_FUNC_I2C); // Set the GPIO pin function to I2C
 gpio_pull_up(I2C_SDA); // Pull up the data line
 gpio_pull_up(I2C_SCL); // Pull up the clock line
 
+}
+void controle_vazão(){
+    double conv_input = (double)(adc_value_x - center_value) *0.0048852; //Converte em um valor de [-10, 10]
+    vel_input += conv_input;
+    vel_input = MAX_FUNC(MIN_FUNC(vel_input,vel_max),0); //Saturação
+    printf("Velocidade de entrada: %f \n",vel_input ); 
+
+    double conv_output = (double)(adc_value_y - center_value) *0.0048852; //Converte em um valor de [-10, 10]
+    vel_output += conv_output;
+    vel_output = MAX_FUNC(MIN_FUNC(vel_output,vel_max),0); //Saturação
+    printf("Velocidade de saída: %f \n",vel_output ); 
+}
+void controle_matrix(PIO pio, uint sm, double volume, bool flag_perigo) {
+    // Define o deslocamento de cor de acordo com a flag_perigo
+    int8_t cor_steps = (flag_perigo) ? 16 : 8;
+    
+    // Mapeia volume [0, 1000] para [0, TOTAL_LEDS] (valor fracionário)
+    double leds_ativos = (TOTAL_LEDS * volume) / volume_max;
+    
+    // Separa a parte inteira e a parte fracionária
+    int leds_full = (int)leds_ativos;         // Número de LEDs totalmente ativos
+    double led_parcial = fmod(leds_ativos, 1.0); // Parte fracionária para o LED parcial
+    int brilho_parcial = (int)(led_parcial * MAX_LED_VALUE);
+    
+    // Calcula o valor para um LED totalmente ativo com deslocamento
+    uint32_t valor_full = ((uint32_t)MAX_LED_VALUE) << cor_steps;
+    // Calcula o valor para o LED parcialmente ativo com deslocamento
+    uint32_t valor_parcial = ((uint32_t)brilho_parcial) << cor_steps;
+    
+    uint32_t valor[25];
+    for (int i = 0; i < TOTAL_LEDS; i++) {
+        if (i < leds_full) {
+            valor[i] = valor_full;
+        } else if (i == leds_full && (led_parcial > 0.0)) {
+            valor[i] = valor_parcial;
+        } else {
+            valor[i] = 0;
+        }}
+    for (int i = 0; i < TOTAL_LEDS; i++){
+        pio_sm_put_blocking(pio, sm, valor[i]);
+    }
 }
