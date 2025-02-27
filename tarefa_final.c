@@ -22,7 +22,6 @@
 #define ENDERECO        0x3C
 #define LED_RED         13
 #define LED_BLUE        12
-#define LED_GREEN       11
 #define BUTTON_A        5
 #define BUTTON_B        6     
 #define JOYSTICK_X      27  
@@ -44,27 +43,31 @@ uint16_t adc_value_x;
 uint16_t adc_value_y;  
 uint16_t center_value = 2000;  // Valor medido experimentalmente
 
-// PWM
+// PWM BUZZER
 uint slice; 
-static uint16_t wrap = 1000;   // Valor de wrap do PWM
+const uint16_t wrap = 1000;   // Valor de wrap do PWM
+// PWM LED - frequência de 10khz
+uint slice_led;
+const uint16_t wrap_led = 255;
+const float div_clock_led = 50.0;
 
 // Display SSD1306
 ssd1306_t ssd; // Display de 128 x 64
 
 // Controle do tanque
 
-volatile double volume = 5000;          // Volume inicial
-static double volume_max = 10000;        // Volume máximo (L)
-volatile double vel_input = 100;         // Vazão de entrada
-volatile double vel_output = 100;         // Vazão de saída
-static double vel_max = 500;               // Vazão máxima
-volatile bool flag_input = false;          // Estado da válvula de entrada
-volatile bool flag_output = false;         // Estado da válvula de saída
+volatile double volume = 480;          // Volume inicial
+const double volume_max = 1200;        // Volume máximo (mL)
+volatile double v_input = 30;         // Vazão de entrada
+volatile double v_output = 30;         // Vazão de saída
+const double vel_max = 60;               // Vazão máxima mL/s
+volatile bool flag_input = false;          // Estado da bomba de entrada
+volatile bool flag_output = false;         // Estado da bomba de saída
 volatile bool flag_max = false;
 volatile bool flag_min = false;
 volatile bool flag_perigo = false;         // Indica situação crítica (volume no limite)
 volatile bool flag_adc = true;             //Indica o estado da leitura do ADC
-static uint16_t sample_time = 100;         // Período de amostragem (ms)
+const uint16_t sample_time = 100;         // Período de amostragem (ms)
 
 //---------------------------------------------------
 // PROTOTIPAÇÃO
@@ -76,6 +79,7 @@ void controle_vazao(int adc_x, int adc_y);
 void controle_matrix(PIO pio, uint sm, double volume, bool flag_perigo);
 void controle_display(void);
 void controle_buzzer(uint slice);
+void controle_atuador(double vel_input, double vel_output);
 
 //---------------------------------------------------
 // FUNÇÃO MAIN
@@ -83,7 +87,6 @@ void controle_buzzer(uint slice);
 int main() {
     stdio_init_all();
     init_pinos();
-    gpio_put(LED_GREEN, 1);
 
     // Configura o timer para atualização periódica dos dados
     struct repeating_timer timer;
@@ -99,14 +102,18 @@ int main() {
     adc_gpio_init(JOYSTICK_X);
     adc_gpio_init(JOYSTICK_Y); 
 
-    // Configura o PWM para o BUZZER
-    gpio_set_function(BUZZER, GPIO_FUNC_PWM);
-    slice = pwm_gpio_to_slice_num(BUZZER);
-    pwm_set_wrap(slice, wrap);
+    // Configura o PWM para o BUZZER e ATUADOR
     pwm_set_enabled(slice, true);
+    pwm_set_wrap(slice, wrap);
+    
+    // Configura o PWM para o ATUADOR/LED
+    pwm_set_enabled(slice_led, true);
+    pwm_set_wrap(slice_led, wrap_led);
+    pwm_set_clkdiv(slice_led, div_clock_led);
+    
 
     // Inicializa o display via I2C
-    i2c_init(I2C_PORT, 1000000); // 1 MHz
+    i2c_init(I2C_PORT, 400000); // 0.4 MHz
     ssd1306_init(&ssd, WIDTH, HEIGHT, false, ENDERECO, I2C_PORT);
     ssd1306_config(&ssd);
     ssd1306_fill(&ssd, false);
@@ -129,10 +136,12 @@ int main() {
         
         // Atualiza a vazão com base nos ADCs
         controle_vazao(adc_value_x, adc_value_y);
-        // Atualiza a matriz de LEDs com o volume atual e situação de perigo
-        controle_matrix(pio, sm_pio, volume, flag_perigo);
+        //Atualiza o PWM do atuador conforme niveis estabelecidos
+        controle_atuador(v_input,v_output);
         // Atualiza o display com os dados atuais
         controle_display();
+        // Atualiza a matriz de LEDs com o volume atual e situação de perigo
+        controle_matrix(pio, sm_pio, volume, flag_perigo);
         // Atualiza o buzzer conforme as condições de segurança
         controle_buzzer(slice);
     }
@@ -163,13 +172,9 @@ static void callback_button(uint gpio, uint32_t events) {
         }
     } else if (gpio == JOYSTICK_BT) {
         if (absolute_time_diff_us(last_time_J, now) > 200000) {
-            flag_adc = !flag_adc;
-            gpio_put(LED_GREEN, flag_adc);
-            gpio_put(LED_RED, !flag_adc);
-            
-            
+
+        
             last_time_J = now;
-            // Outras ações para o joystick podem ser adicionadas aqui
         }
     }
 }
@@ -199,7 +204,7 @@ bool atualiza_dados(struct repeating_timer *t) {
     
     // Calcula a variação de volume (delta) considerando o tempo de amostragem (em segundos)
     double delta_time = (double)sample_time / 1000.0;
-    double delta_volume = ((flag_input ? vel_input : 0) - (flag_output ? vel_output : 0)) * delta_time;
+    double delta_volume = ((flag_input ? v_input : 0) - (flag_output ? v_output : 0)) * delta_time;
     volume += delta_volume;
     volume = MAX_FUNC(MIN_FUNC(volume, volume_max), 0);
 
@@ -215,13 +220,11 @@ void init_pinos(void) {
     gpio_set_function(BUZZER, GPIO_FUNC_PWM);
     slice = pwm_gpio_to_slice_num(BUZZER);
 
-    // Inicializa LEDs de indicação (se houver)
-    gpio_init(LED_GREEN);
-    gpio_set_dir(LED_GREEN, GPIO_OUT);
-    gpio_init(LED_RED);
-    gpio_set_dir(LED_RED, GPIO_OUT);
-    gpio_init(LED_BLUE);
-    gpio_set_dir(LED_BLUE, GPIO_OUT);
+    // Inicializa LEDs 
+    gpio_set_function(LED_RED, GPIO_FUNC_PWM);
+    gpio_set_function(LED_BLUE, GPIO_FUNC_PWM);
+    slice_led = pwm_gpio_to_slice_num(LED_RED);
+
 
     // Inicializa os botões com pull-up
     gpio_init(BUTTON_A);
@@ -253,16 +256,18 @@ void controle_vazao(int adc_x, int adc_y) {
     uint16_t leitura_y = (abs(adc_y - center_value) > tolerancia) ? adc_y : center_value;
     
     // Converte a variação do ADC em incremento para a vazão (escala aproximada de [-10,10])
-    if (flag_adc){
+    flag_adc = !flag_input & !flag_output;
+    if (!flag_input){
         double conv_input = (double)(leitura_x - center_value) * 0.00048852*2;
-        vel_input += conv_input;
-        vel_input = MAX_FUNC(MIN_FUNC(vel_input, vel_max), 0);
-        printf("Velocidade de entrada: %f\n", vel_input);
-
+        v_input += conv_input;
+        v_input = MAX_FUNC(MIN_FUNC(v_input, vel_max), 0);
+        printf("Velocidade de entrada: %f\n", v_input);
+    }
+    if (!flag_output){
         double conv_output = (double)(leitura_y - center_value) * 0.00048852*2;
-        vel_output += conv_output;
-        vel_output = MAX_FUNC(MIN_FUNC(vel_output, vel_max), 0);
-        printf("Velocidade de saída: %f\n", vel_output);
+        v_output += conv_output;
+        v_output = MAX_FUNC(MIN_FUNC(v_output, vel_max), 0);
+        printf("Velocidade de saída: %f\n", v_output);
     }
 }
 
@@ -300,8 +305,8 @@ void controle_matrix(PIO pio, uint sm, double volume, bool flag_perigo) {
 //---------------------------------------------------
 void controle_display(void) {
     uint16_t volume_p100 = (uint16_t)(100 * (volume / volume_max));
-    uint16_t vel_input_p100 = (uint16_t)(100 * (vel_input / vel_max));
-    uint16_t vel_output_p100 = (uint16_t)(100 * (vel_output / vel_max));
+    uint16_t vel_input_p100 = (uint16_t)(100 * (v_input / vel_max));
+    uint16_t vel_output_p100 = (uint16_t)(100 * (v_output / vel_max));
 
     char exibir_volume[4];
     char exibir_input[4];
@@ -360,4 +365,15 @@ void controle_buzzer(uint slice) {
         // Sem alarme: buzzer desligado
         pwm_set_gpio_level(BUZZER, 0);
     }
+}
+//---------------------------------------------------
+// FUNÇÃO PARA ATUALIZAR A POTÊNCIA DO ATUADOR
+//---------------------------------------------------
+void controle_atuador(double vel_input, double vel_output){
+    uint16_t level_input = (uint16_t)255 * (vel_input/ vel_max);
+    uint16_t level_output = (uint16_t)255 * (vel_output/ vel_max);
+
+    pwm_set_gpio_level(LED_RED, level_input);
+    pwm_set_gpio_level(LED_BLUE, level_output);
+
 }
